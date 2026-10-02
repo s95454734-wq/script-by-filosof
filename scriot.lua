@@ -1,34 +1,45 @@
--- Сервисы Roblox
-local Players = game:GetService("Players")
-local CoreGui = game:GetService("CoreGui")
-local TweenService = game:GetService("TweenService")
+-- Blox Strike Utility | Xeno Edition | v2
+-- Работает: ESP, BHOP, SPEED (до 22), FLY (CFrame), NOCLIP (CFrame)
+-- Автор: адаптация под Blox Strike
+
+local Players          = game:GetService("Players")
+local CoreGui          = game:GetService("CoreGui")
+local TweenService     = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
+local RunService       = game:GetService("RunService")
 
 local localPlayer = Players.LocalPlayer
-local camera = workspace.CurrentCamera
+local camera      = workspace.CurrentCamera
 
--- Состояния функций
-local espEnabled = false
-local bhopEnabled = false
-local flyEnabled = false
+-- ============ СОСТОЯНИЯ ============
+local espEnabled    = false
+local bhopEnabled   = false
+local flyEnabled    = false
 local noclipEnabled = false
-local speedEnabled = false
+local speedEnabled  = false
 
-local flySpeed = 50
-local walkSpeedValue = 32
+local flySpeed        = 60     -- скорость CFrame-полёта
+local walkSpeedValue  = 22     -- безопасный лимит в Blox Strike (16-22)
+local bhopPower       = 45
 
+-- ============ ХРАНИЛИЩА ============
 local activeHighlights = {}
 local noclipConnection = nil
-local savedCollisions = {}
+local savedCollisions  = {}
+local flyConnection    = nil
 
--- 1. СОЗДАНИЕ ИНТЕРФЕЙСА (GUI)
+-- =========================================================
+-- 1. GUI
+-- =========================================================
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "BloxStrikeLegitGUI"
+screenGui.Name = "BloxStrikeUtility"
 screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
-local success = pcall(function() screenGui.Parent = CoreGui end)
-if not success then screenGui.Parent = localPlayer:WaitForChild("PlayerGui") end
+local ok = pcall(function() screenGui.Parent = CoreGui end)
+if not ok then
+    screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
+end
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(0, 360, 0, 200)
@@ -52,16 +63,18 @@ titleLabel.Font = Enum.Font.SourceSansBold
 titleLabel.TextSize = 16
 titleLabel.Parent = mainFrame
 
-local TOGGLE_KEY = Enum.KeyCode.Insert
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    if input.KeyCode == TOGGLE_KEY then mainFrame.Visible = not mainFrame.Visible end
+-- Переключение видимости меню
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.Insert then
+        mainFrame.Visible = not mainFrame.Visible
+    end
 end)
 
-local function createButton(text, position)
+local function createButton(text, pos)
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(0, 150, 0, 40)
-    btn.Position = position
+    btn.Position = pos
     btn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
     btn.Text = text .. ": OFF"
     btn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -69,18 +82,17 @@ local function createButton(text, position)
     btn.TextSize = 14
     btn.Parent = mainFrame
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = btn
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 6)
+    c.Parent = btn
     return btn
 end
 
-local espButton = createButton("ESP", UDim2.new(0, 20, 0, 45))
-local bhopButton = createButton("BHOP", UDim2.new(0, 20, 0, 95))
-local speedButton = createButton("FAST SPEED", UDim2.new(0, 20, 0, 145))
-
-local flyButton = createButton("FLY", UDim2.new(0, 190, 0, 45))
-local noclipButton = createButton("NO CLIP", UDim2.new(0, 190, 0, 95))
+local espButton    = createButton("ESP",        UDim2.new(0, 20,  0, 45))
+local bhopButton   = createButton("BHOP",       UDim2.new(0, 20,  0, 95))
+local speedButton  = createButton("FAST SPEED", UDim2.new(0, 20,  0, 145))
+local flyButton    = createButton("FLY",        UDim2.new(0, 190, 0, 45))
+local noclipButton = createButton("NO CLIP",    UDim2.new(0, 190, 0, 95))
 
 local function toggleVisual(button, state, name)
     button.Text = name .. (state and ": ON" or ": OFF")
@@ -88,132 +100,159 @@ local function toggleVisual(button, state, name)
     TweenService:Create(button, TweenInfo.new(0.2), {BackgroundColor3 = color}):Play()
 end
 
--- 2. ЛОГИКА ESP
-local function createHighlight(character)
-    local oldHighlight = character:FindFirstChild("ESPHighlight")
-    if oldHighlight then oldHighlight:Destroy() end
-    local highlight = Instance.new("Highlight")
-    highlight.Name = "ESPHighlight"
-    highlight.FillColor = Color3.fromRGB(255, 0, 0)
-    highlight.FillTransparency = 0.5
-    highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
-    highlight.Enabled = espEnabled
-    highlight.Parent = character
-    return highlight
+-- =========================================================
+-- 2. ESP
+-- =========================================================
+local function createHighlight(char)
+    if not char or not char.Parent then return end
+    local old = char:FindFirstChild("BS_ESP")
+    if old then old:Destroy() end
+
+    local hl = Instance.new("Highlight")
+    hl.Name = "BS_ESP"
+    hl.FillColor = Color3.fromRGB(255, 0, 0)
+    hl.FillTransparency = 0.4
+    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Enabled = espEnabled
+    hl.Parent = char
+    return hl
 end
 
 local function monitorPlayer(player)
     if player == localPlayer then return end
-    player.CharacterAdded:Connect(function(character)
+
+    player.CharacterAdded:Connect(function(char)
         task.wait(0.2)
-        if character and character.Parent then activeHighlights[player] = createHighlight(character) end
+        activeHighlights[player] = createHighlight(char)
     end)
-    if player.Character then activeHighlights[player] = createHighlight(player.Character) end
+
+    if player.Character then
+        activeHighlights[player] = createHighlight(player.Character)
+    end
 end
 
-for _, player in pairs(Players:GetPlayers()) do monitorPlayer(player) end
+for _, p in pairs(Players:GetPlayers()) do monitorPlayer(p) end
 Players.PlayerAdded:Connect(monitorPlayer)
 
--- 3. ЦИКЛ ДЛЯ ПОЛЕТА (FLY), СКОРОСТИ (SPEED) И BHOP
-local bodyVelocity = nil
-local bodyGyro = nil
-local flyAttachment = nil
-
-RunService.RenderStepped:Connect(function()
-    local character = localPlayer.Character
-    if not character then return end
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    local rootPart = character:FindFirstChild("HumanoidRootPart")
-    if not humanoid or not rootPart or humanoid.Health <= 0 then return end
-
-    -- ЛОГИКА FAST SPEED (через отдельную переменную speedEnabled)
-    if not flyEnabled then
-        local targetSpeed = speedEnabled and walkSpeedValue or 16
-        if humanoid.WalkSpeed ~= targetSpeed then
-            humanoid.WalkSpeed = targetSpeed
+-- =========================================================
+-- 3. FLY (CFrame-стиль — работает там, где физика заблокирована)
+-- =========================================================
+local function stopFly()
+    if flyConnection then
+        flyConnection:Disconnect()
+        flyConnection = nil
+    end
+    -- Возвращаем управление персонажем
+    local char = localPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.PlatformStand = false
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
         end
     end
+end
 
-    -- ЛОГИКА BHOP
-    if bhopEnabled and not flyEnabled and UserInputService:IsKeyDown(Enum.KeyCode.Space) then
-        if humanoid.FloorMaterial ~= Enum.Material.Air then
-            rootPart.Velocity = Vector3.new(rootPart.Velocity.X, 45, rootPart.Velocity.Z)
-        end
+local function startFly()
+    if flyConnection then flyConnection:Disconnect() end
+
+    local char = localPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum.PlatformStand = true end
     end
 
-    -- ЛОГИКА ПОЛЕТА (FLY) — LinearVelocity + BodyGyro
-    if flyEnabled then
-        humanoid.PlatformStand = true
-        humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+    flyConnection = RunService.RenderStepped:Connect(function()
+        if not flyEnabled then return end
+        local char = localPlayer.Character
+        if not char then return end
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if not root then return end
 
-        if not bodyVelocity or bodyVelocity.Parent ~= rootPart then
-            if bodyVelocity then bodyVelocity:Destroy() end
-            if bodyGyro then bodyGyro:Destroy() end
-            if flyAttachment then flyAttachment:Destroy() end
+        local dir = Vector3.zero
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += camera.CFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= camera.CFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= camera.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += camera.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then dir -= Vector3.yAxis end
 
-            flyAttachment = Instance.new("Attachment")
-            flyAttachment.Parent = rootPart
-
-            bodyVelocity = Instance.new("LinearVelocity")
-            bodyVelocity.MaxForce = math.huge
-            bodyVelocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
-            bodyVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
-            bodyVelocity.Attachment0 = flyAttachment
-            bodyVelocity.Parent = rootPart
-
-            bodyGyro = Instance.new("BodyGyro")
-            bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-            bodyGyro.P = 10000
-            bodyGyro.D = 500
-            bodyGyro.CFrame = rootPart.CFrame
-            bodyGyro.Parent = rootPart
+        if dir.Magnitude > 0 then
+            root.CFrame = root.CFrame + dir.Unit * (flySpeed / 60)
         end
+    end)
+end
 
-        -- Гироскоп удерживает ориентацию по камере
-        bodyGyro.CFrame = CFrame.new(rootPart.Position, rootPart.Position + camera.CFrame.LookVector)
-
-        local direction = Vector3.new(0, 0, 0)
-        if UserInputService:IsKeyDown(Enum.KeyCode.W) then direction += camera.CFrame.LookVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.S) then direction -= camera.CFrame.LookVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.A) then direction -= camera.CFrame.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.D) then direction += camera.CFrame.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then direction += Vector3.new(0, 1, 0) end
-        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then direction -= Vector3.new(0, 1, 0) end
-
-        if direction.Magnitude > 0 then
-            bodyVelocity.VectorVelocity = direction.Unit * flySpeed
-        else
-            bodyVelocity.VectorVelocity = Vector3.new(0, 0, 0)
-        end
-    else
-        if bodyVelocity then bodyVelocity:Destroy() bodyVelocity = nil end
-        if bodyGyro then bodyGyro:Destroy() bodyGyro = nil end
-        if flyAttachment then flyAttachment:Destroy() flyAttachment = nil end
-        if humanoid.PlatformStand then humanoid.PlatformStand = false end
+-- =========================================================
+-- 4. NOCLIP (CFrame-стиль — двигаемся сквозь стены телепортом)
+-- =========================================================
+local function stopNoclip()
+    if noclipConnection then
+        noclipConnection:Disconnect()
+        noclipConnection = nil
     end
-end)
+    for part in pairs(savedCollisions) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = true end)
+        end
+    end
+    savedCollisions = {}
+end
 
--- 4. ЛОГИКА NO CLIP
 local function startNoclip()
     if noclipConnection then noclipConnection:Disconnect() end
+
     noclipConnection = RunService.Stepped:Connect(function()
-        if noclipEnabled and localPlayer.Character then
-            for _, part in pairs(localPlayer.Character:GetDescendants()) do
-                if part:IsA("BasePart") and part.CanCollide then
-                    savedCollisions[part] = true
-                    part.CanCollide = false
-                end
+        if not noclipEnabled then return end
+        local char = localPlayer.Character
+        if not char then return end
+        for _, part in pairs(char:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then
+                savedCollisions[part] = true
+                part.CanCollide = false
             end
         end
     end)
 end
 
--- 5. ОБРАБОТКА НАЖАТИЙ КНОПОК
+-- =========================================================
+-- 5. ГЛАВНЫЙ ЦИКЛ (SPEED + BHOP)
+-- =========================================================
+RunService.RenderStepped:Connect(function()
+    local char = localPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root or hum.Health <= 0 then return end
+
+    -- FAST SPEED
+    if speedEnabled and not flyEnabled then
+        if hum.WalkSpeed ~= walkSpeedValue then
+            hum.WalkSpeed = walkSpeedValue
+        end
+    elseif not speedEnabled and not flyEnabled then
+        if hum.WalkSpeed ~= 16 then
+            hum.WalkSpeed = 16
+        end
+    end
+
+    -- BHOP
+    if bhopEnabled and not flyEnabled and UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+        if hum.FloorMaterial ~= Enum.Material.Air then
+            root.Velocity = Vector3.new(root.Velocity.X, bhopPower, root.Velocity.Z)
+        end
+    end
+end)
+
+-- =========================================================
+-- 6. КНОПКИ
+-- =========================================================
 espButton.MouseButton1Click:Connect(function()
     espEnabled = not espEnabled
     toggleVisual(espButton, espEnabled, "ESP")
-    for _, highlight in pairs(activeHighlights) do
-        if highlight and highlight.Parent then highlight.Enabled = espEnabled end
+    for _, hl in pairs(activeHighlights) do
+        if hl and hl.Parent then hl.Enabled = espEnabled end
     end
 end)
 
@@ -230,6 +269,11 @@ end)
 flyButton.MouseButton1Click:Connect(function()
     flyEnabled = not flyEnabled
     toggleVisual(flyButton, flyEnabled, "FLY")
+    if flyEnabled then
+        startFly()
+    else
+        stopFly()
+    end
 end)
 
 noclipButton.MouseButton1Click:Connect(function()
@@ -238,15 +282,6 @@ noclipButton.MouseButton1Click:Connect(function()
     if noclipEnabled then
         startNoclip()
     else
-        if noclipConnection then
-            noclipConnection:Disconnect()
-            noclipConnection = nil
-        end
-        for part, _ in pairs(savedCollisions) do
-            if part and part.Parent then
-                part.CanCollide = true
-            end
-        end
-        savedCollisions = {}
+        stopNoclip()
     end
 end)
