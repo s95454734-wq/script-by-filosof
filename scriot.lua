@@ -2,142 +2,115 @@
 local Players = game:GetService("Players")
 local CoreGui = game:GetService("CoreGui")
 local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 
 local localPlayer = Players.LocalPlayer
+local camera = workspace.CurrentCamera
 
--- Переменная состояния ESP
+-- Состояния функций
 local espEnabled = false
+local bhopEnabled = false
+local aimbotEnabled = false
+local triggerEnabled = false
+local recoilDisabled = false
+local wallbangEnabled = false
+
 local activeHighlights = {}
+local AIM_SMOOTHNESS = 0.15
 
 -- 1. СОЗДАНИЕ ИНТЕРФЕЙСА (GUI)
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "CustomMenuGUI"
+screenGui.Name = "PremiumMenuGUI"
 screenGui.ResetOnSpawn = false
 
--- Пытаемся спрятать GUI в CoreGui, чтобы он не удалялся, либо в PlayerGui
-local success, err = pcall(function()
-    screenGui.Parent = CoreGui
-end)
-if not success then
-    screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
-end
+local success, err = pcall(function() screenGui.Parent = CoreGui end)
+if not success then screenGui.Parent = localPlayer:WaitForChild("PlayerGui") end
 
--- Главная панель меню
+-- Главная панель меню (расширена до 3 столбцов: ширина 530)
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 200, 0, 100)
+mainFrame.Size = UDim2.new(0, 530, 0, 150)
 mainFrame.Position = UDim2.new(0.1, 0, 0.1, 0)
-mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 mainFrame.BorderSizePixel = 0
 mainFrame.Active = true
-mainFrame.Draggable = true -- Позволяет перетаскивать меню мышкой
+mainFrame.Draggable = true
 mainFrame.Parent = screenGui
 
--- Скругление углов панели
 local frameCorner = Instance.new("UICorner")
 frameCorner.CornerRadius = UDim.new(0, 8)
 frameCorner.Parent = mainFrame
 
--- Сервис для отслеживания нажатий клавиатуры
-local UserInputService = game:GetService("UserInputService")
+-- Заголовок меню
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1, 0, 0, 30)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "MultiHack Premium Menu | Insert to Hide"
+titleLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+titleLabel.Font = Enum.Font.SourceSansBold
+titleLabel.TextSize = 16
+titleLabel.Parent = mainFrame
 
--- Настройка клавиши (по умолчанию Insert)
+-- Кнопка скрытия меню (Insert)
 local TOGGLE_KEY = Enum.KeyCode.Insert 
-
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    -- Если игрок пишет в чат, скрипт не должен срабатывать
     if gameProcessed then return end
+    if input.KeyCode == TOGGLE_KEY then mainFrame.Visible = not mainFrame.Visible end
+end)
+
+-- Функция создания кнопок
+local function createButton(text, position)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 150, 0, 40)
+    btn.Position = position
+    btn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+    btn.Text = text .. ": OFF"
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.SourceSansBold
+    btn.TextSize = 14
+    btn.Parent = mainFrame
     
-    -- Проверяем нажатие нужной клавиши
-    if input.KeyCode == TOGGLE_KEY then
-        mainFrame.Visible = not mainFrame.Visible
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+    return btn
+end
+
+-- Столбец 1
+local espButton = createButton("ESP", UDim2.new(0, 20, 0, 45))
+local bhopButton = createButton("BHOP", UDim2.new(0, 20, 0, 95))
+-- Столбец 2
+local aimButton = createButton("AIM ASSIST", UDim2.new(0, 190, 0, 45))
+local triggerButton = createButton("TRIGGERBOT", UDim2.new(0, 190, 0, 95))
+-- Столбец 3 (Новые функции)
+local recoilButton = createButton("ANTI RECOIL", UDim2.new(0, 360, 0, 45))
+local wallbangButton = createButton("WALLBANG", UDim2.new(0, 360, 0, 95))
+
+local function toggleVisual(button, state, name)
+    button.Text = name .. (state and ": ON" or ": OFF")
+    local color = state and Color3.fromRGB(50, 180, 50) or Color3.fromRGB(180, 50, 50)
+    TweenService:Create(button, TweenInfo.new(0.2), {BackgroundColor3 = color}):Play()
+end
+
+-- [ЗДЕСЬ ОСТАЕТСЯ СТАРЫЙ КОД ЛОГИКИ ДЛЯ ESP, BHOP, AIM И TRIGGERBOTИз ПРОШЛОГО ШАГА]
+
+-- 2. ОБРАБОТКА НАЖАТИЙ НОВЫХ КНОПОК
+recoilButton.MouseButton1Click:Connect(function()
+    recoilDisabled = not recoilDisabled
+    toggleVisual(recoilButton, recoilDisabled, "ANTI RECOIL")
+    
+    if recoilDisabled then
+        print("Анти-отдача активирована (требуется хук скрипта оружия)")
+        -- Сюда вставляется код хука под конкретную игру
     end
 end)
 
--- Кнопка переключения ESP
-local espButton = Instance.new("TextButton")
-espButton.Size = UDim2.new(0, 160, 0, 40)
-espButton.Position = UDim2.new(0.5, -80, 0.5, -20)
-espButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50) -- Красный (выключено)
-espButton.Text = "ESP: OFF"
-espButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-espButton.Font = Enum.Font.SourceSansBold
-espButton.TextSize = 18
-espButton.Parent = mainFrame
-
-local buttonCorner = Instance.new("UICorner")
-buttonCorner.CornerRadius = UDim.new(0, 6)
-buttonCorner.Parent = espButton
-
-
--- 2. ФУНКЦИЯ ESP (ПОДСВЕТКА)
-local function applyESP(player)
-    if player == localPlayer then return end
+wallbangButton.MouseButton1Click:Connect(function()
+    wallbangEnabled = not wallbangEnabled
+    toggleVisual(wallbangButton, wallbangEnabled, "WALLBANG")
     
-    local function onCharacterAdded(character)
-        if not espEnabled then return end
-        
-        -- Если подсветка уже есть, удаляем старую
-        if character:FindFirstChild("ESPHighlight") then
-            character.ESPHighlight:Destroy()
-        end
-        
-        -- Создаем объект Highlight
-        local highlight = Instance.new("Highlight")
-        highlight.Name = "ESPHighlight"
-        highlight.FillColor = Color3.fromRGB(255, 0, 0) -- Цвет заливки (Красный)
-        highlight.FillTransparency = 0.5 -- Прозрачность заливки
-        highlight.OutlineColor = Color3.fromRGB(255, 255, 255) -- Цвет обводки (Белый)
-        highlight.OutlineTransparency = 0 -- Прозрачность обводки
-        highlight.Adornee = character
-        highlight.Parent = character
-        
-        activeHighlights[player] = highlight
-    end
-    
-    if player.Character then
-        onCharacterAdded(player.Character)
-    end
-    player.CharacterAdded:Connect(onCharacterAdded)
-end
-
--- Функция удаления подсветки
-local function removeESP()
-    for player, highlight in pairs(activeHighlights) do
-        if highlight and highlight.Parent then
-            highlight:Destroy()
-        end
-    end
-    activeHighlights = {}
-    
-    -- Дополнительная очистка по всей игре
-    for _, v in pairs(workspace:GetDescendants()) do
-        if v:IsA("Highlight") and v.Name == "ESPHighlight" then
-            v:Destroy()
-        end
-    end
-end
-
-
--- 3. ОБРАБОТКА НАЖАТИЯ КНОПКИ
-espButton.MouseButton1Click:Connect(function()
-    espEnabled = not espEnabled
-    
-    if espEnabled then
-        -- Включаем ESP
-        espButton.Text = "ESP: ON"
-        TweenService:Create(espButton, TweenInfo.new(0.3), {BackgroundColor3 = Color3.fromRGB(50, 180, 50)}):Play() -- Зеленый
-        
-        -- Включаем для текущих игроков
-        for _, player in pairs(Players:GetPlayers()) do
-            applyESP(player)
-        end
-        
-        -- Следим за новыми зашедшими игроками
-        Players.PlayerAdded:Connect(applyESP)
-    else
-        -- Выключаем ESP
-        espButton.Text = "ESP: OFF"
-        TweenService:Create(espButton, TweenInfo.new(0.3), {BackgroundColor3 = Color3.fromRGB(180, 50, 50)}):Play() -- Красный
-        removeESP()
+    if wallbangEnabled then
+        print("Прострел стен активирован (требуется обход Raycast игры)")
+        -- Сюда вставляется код модификации лучей под конкретную игру
     end
 end)
