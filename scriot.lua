@@ -4,7 +4,6 @@ local CoreGui = game:GetService("CoreGui")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
-local VirtualInputManager = game:GetService("VirtualInputManager") -- Сервис для симуляции кликов
 
 local localPlayer = Players.LocalPlayer
 local camera = workspace.CurrentCamera
@@ -12,25 +11,26 @@ local camera = workspace.CurrentCamera
 -- Состояния функций
 local espEnabled = false
 local bhopEnabled = false
-local aimbotEnabled = false
-local triggerEnabled = false
+local flyEnabled = false
+local noclipEnabled = false
+
+local flySpeed = 50 -- Скорость полета по умолчанию
+local walkSpeedValue = 32 -- Кастомная скорость бега
 
 local activeHighlights = {}
-
--- Настройки (можно менять под себя)
-local AIM_SMOOTHNESS = 0.12 -- Плавность (меньше = быстрее)
-local TRIGGER_DELAY = 0.05  -- Задержка выстрела
+local noclipConnection = nil
 
 -- 1. СОЗДАНИЕ ИНТЕРФЕЙСА (GUI)
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "BloxStrikeGUI"
+screenGui.Name = "BloxStrikeLegitGUI"
 screenGui.ResetOnSpawn = false
 
 local success, err = pcall(function() screenGui.Parent = CoreGui end)
 if not success then screenGui.Parent = localPlayer:WaitForChild("PlayerGui") end
 
+-- Главная панель меню (увеличена под 5 кнопок)
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 360, 0, 150)
+mainFrame.Size = UDim2.new(0, 360, 0, 200)
 mainFrame.Position = UDim2.new(0.1, 0, 0.1, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 mainFrame.BorderSizePixel = 0
@@ -45,7 +45,7 @@ frameCorner.Parent = mainFrame
 local titleLabel = Instance.new("TextLabel")
 titleLabel.Size = UDim2.new(1, 0, 0, 30)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "Blox Strike Legit | Insert to Hide"
+titleLabel.Text = "Blox Strike Utility | Insert to Hide"
 titleLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
 titleLabel.Font = Enum.Font.SourceSansBold
 titleLabel.TextSize = 16
@@ -66,7 +66,7 @@ local function createButton(text, position)
     btn.Text = text .. ": OFF"
     btn.TextColor3 = Color3.fromRGB(255, 255, 255)
     btn.Font = Enum.Font.SourceSansBold
-    btn.TextSize = 15
+    btn.TextSize = 14
     btn.Parent = mainFrame
     
     local corner = Instance.new("UICorner")
@@ -75,11 +75,13 @@ local function createButton(text, position)
     return btn
 end
 
--- Кнопки управления
+-- Размещение кнопок в два столбца
 local espButton = createButton("ESP", UDim2.new(0, 20, 0, 45))
 local bhopButton = createButton("BHOP", UDim2.new(0, 20, 0, 95))
-local aimButton = createButton("AIM ASSIST", UDim2.new(0, 190, 0, 45))
-local triggerButton = createButton("TRIGGERBOT", UDim2.new(0, 190, 0, 95))
+local speedButton = createButton("FAST SPEED", UDim2.new(0, 20, 0, 145))
+
+local flyButton = createButton("FLY", UDim2.new(0, 190, 0, 45))
+local noclipButton = createButton("NO CLIP", UDim2.new(0, 190, 0, 95))
 
 local function toggleVisual(button, state, name)
     button.Text = name .. (state and ": ON" or ": OFF")
@@ -87,34 +89,8 @@ local function toggleVisual(button, state, name)
     TweenService:Create(button, TweenInfo.new(0.2), {BackgroundColor3 = color}):Play()
 end
 
--- 2. ПОИСК ЦЕЛИДЛЯ АИМА
-local function getClosestPlayer()
-    local closestPlayer = nil
-    local shortestDistance = math.huge
-    local mousePos = UserInputService:GetMouseLocation()
 
-    for _, player in pairs(Players:GetPlayers()) do
-        if player ~= localPlayer and player.Character then
-            -- Ищем голову или верхнюю часть торса (на случай кастомных хитбоксов)
-            local targetPart = player.Character:FindFirstChild("Head") or player.Character:FindFirstChild("HumanoidRootPart")
-            local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
-            
-            if targetPart and humanoid and humanoid.Health > 0 then
-                local pos, onScreen = camera:WorldToViewportPoint(targetPart.Position)
-                if onScreen then
-                    local distance = (Vector2.new(pos.X, pos.Y) - mousePos).Magnitude
-                    if distance < shortestDistance then
-                        closestPlayer = player
-                        shortestDistance = distance
-                    end
-                end
-            end
-        end
-    end
-    return closestPlayer
-end
-
--- 3. ЛОГИКА ESP
+-- 2. ЛОГИКА ESP
 local function createHighlight(character)
     local oldHighlight = character:FindFirstChild("ESPHighlight")
     if oldHighlight then oldHighlight:Destroy() end
@@ -140,7 +116,10 @@ end
 for _, player in pairs(Players:GetPlayers()) do monitorPlayer(player) end
 Players.PlayerAdded:Connect(monitorPlayer)
 
--- 4. ЕДИНЫЙ ОБНОВЛЕННЫЙ ЦИКЛ (ОБРАБОТКА КАДРОВ)
+
+-- 3. ЦИКЛ ДЛЯ ПОЛЕТА (FLY), СКОРОСТИ (SPEED) И BHOP
+local bodyVelocity = nil
+
 RunService.RenderStepped:Connect(function()
     local character = localPlayer.Character
     if not character then return end
@@ -148,50 +127,74 @@ RunService.RenderStepped:Connect(function()
     local rootPart = character:FindFirstChild("HumanoidRootPart")
     if not humanoid or not rootPart or humanoid.Health <= 0 then return end
 
-    -- НАДЕЖНЫЙ BHOP (Прямое изменение импульса прыжка)
-    if bhopEnabled and UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+    -- ЛОГИКА FAST SPEED
+    if not flyEnabled then
+        -- Если полет выключен, контролируем наземную скорость бега
+        humanoid.WalkSpeed = speedButton.Text == "FAST SPEED: ON" and walkSpeedValue or 16
+    end
+
+    -- ЛОГИКА BHOP
+    if bhopEnabled and not flyEnabled and UserInputService:IsKeyDown(Enum.KeyCode.Space) then
         if humanoid.FloorMaterial ~= Enum.Material.Air then
             rootPart.Velocity = Vector3.new(rootPart.Velocity.X, 45, rootPart.Velocity.Z)
         end
     end
 
-    -- AIM ASSIST (Теперь наводит, когда зажата ПРАВАЯ кнопка мыши)
-    if aimbotEnabled and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
-        local target = getClosestPlayer()
-        if target and target.Character then
-            local aimPart = target.Character:FindFirstChild("Head") or target.Character:FindFirstChild("HumanoidRootPart")
-            if aimPart then
-                camera.CFrame = camera.CFrame:Lerp(CFrame.new(camera.CFrame.Position, aimPart.Position), AIM_SMOOTHNESS)
-            end
+    -- ЛОГИКА ПОЛЕТА (FLY)
+    if flyEnabled then
+        humanoid.PlatformStand = true -- Отключаем стандартную анимацию ходьбы/падения
+        
+        if not bodyVelocity or bodyVelocity.Parent ~= rootPart then
+            if bodyVelocity then bodyVelocity:Destroy() end
+            bodyVelocity = Instance.new("BodyVelocity")
+            bodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+            bodyVelocity.Parent = rootPart
         end
-    end
 
-    -- ИСПРАВЛЕННЫЙ TRIGGERBOT (Использует симуляцию ввода клика мыши)
-    if triggerEnabled then
-        local mousePos = UserInputService:GetMouseLocation()
-        local unitRay = camera:ScreenPointToRay(mousePos.X, mousePos.Y)
-        
-        local raycastParams = RaycastParams.new()
-        raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-        raycastParams.FilterDescendantsInstances = {character, camera}
-        
-        local result = workspace:Raycast(unitRay.Origin, unitRay.Direction * 2000, raycastParams)
-        if result and result.Instance then
-            local hitModel = result.Instance:FindFirstAncestorOfClass("Model")
-            if hitModel and hitModel:FindFirstChildOfClass("Humanoid") and hitModel ~= character then
-                local targetPlayer = Players:GetPlayerFromCharacter(hitModel)
-                if targetPlayer and targetPlayer ~= localPlayer then
-                    -- Симулируем реальное нажатие левой кнопки мыши (MouseButton1)
-                    VirtualInputManager:SendMouseButtonEvent(mousePos.X, mousePos.Y, 0, true, game, 0)
-                    task.wait(TRIGGER_DELAY)
-                    VirtualInputManager:SendMouseButtonEvent(mousePos.X, mousePos.Y, 0, false, game, 0)
-                end
-            end
+        -- Рассчитываем направление полета по камере игрока
+        local direction = Vector3.new(0, 0, 0)
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then direction = direction + camera.CFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then direction = direction - camera.CFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then direction = direction - camera.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then direction = direction + camera.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then direction = direction + Vector3.new(0, 1, 0) end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then direction = direction - Vector3.new(0, 1, 0) end
+
+        if direction.Magnitude > 0 then
+            bodyVelocity.Velocity = direction.Unit * flySpeed
+        else
+            bodyVelocity.Velocity = Vector3.new(0, 0, 0) -- Зависание на месте, если кнопки не зажаты
+        end
+    else
+        -- Корректное отключение полета
+        if bodyVelocity then
+            bodyVelocity:Destroy()
+            bodyVelocity = nil
+        end
+        if humanoid.PlatformStand then
+            humanoid.PlatformStand = false
         end
     end
 end)
 
--- 5. НАЖАТИЯ КНОПОК
+
+-- 4. ЛОГИКА NO CLIP (ПРОХОЖДЕНИЕ СКВОЗЬ СТЕНЫ)
+local function startNoclip()
+    if noclipConnection then noclipConnection:Disconnect() end
+    noclipConnection = RunService.Stepped:Connect(function()
+        if noclipEnabled and localPlayer.Character then
+            -- Каждым кадром отключаем коллизию всех деталей персонажа со стенами карты
+            for _, part in pairs(localPlayer.Character:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end
+    end)
+end
+
+
+-- 5. ОБРАБОТКА НАЖАТИЙ КНОПОК
 espButton.MouseButton1Click:Connect(function()
     espEnabled = not espEnabled
     toggleVisual(espButton, espEnabled, "ESP")
@@ -205,12 +208,23 @@ bhopButton.MouseButton1Click:Connect(function()
     toggleVisual(bhopButton, bhopEnabled, "BHOP")
 end)
 
-aimButton.MouseButton1Click:Connect(function()
-    aimbotEnabled = not aimbotEnabled
-    toggleVisual(aimButton, aimbotEnabled, "AIM ASSIST")
+speedButton.MouseButton1Click:Connect(function()
+    local state = (speedButton.Text == "FAST SPEED: OFF")
+    toggleVisual(speedButton, state, "FAST SPEED")
 end)
 
-triggerButton.MouseButton1Click:Connect(function()
-    triggerEnabled = not triggerEnabled
-    toggleVisual(triggerButton, triggerEnabled, "TRIGGERBOT")
+flyButton.MouseButton1Click:Connect(function()
+    flyEnabled = not flyEnabled
+    toggleVisual(flyButton, flyEnabled, "FLY")
+end)
+
+noclipButton.MouseButton1Click:Connect(function()
+    noclipEnabled = not noclipEnabled
+    toggleVisual(noclipButton, noclipEnabled, "NO CLIP")
+    if noclipEnabled then
+        startNoclip()
+    elseif noclipConnection then
+        noclipConnection:Disconnect()
+        noclipConnection = nil
+    end
 end)
