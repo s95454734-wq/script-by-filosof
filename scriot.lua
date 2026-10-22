@@ -6,8 +6,9 @@
   дыр античита своей игры.
 
   УПРАВЛЕНИЕ:
-    RightShift / Insert  - открыть / закрыть ClickGUI
-    Кнопка [F] на экране - открыть GUI, когда оно закрыто (для мобильных)
+    RightShift / Insert / RightControl / K - открыть / закрыть ClickGUI
+    Круглая кнопка [F] слева вверху экрана видна ВСЕГДА - тап по ней
+    открывает/закрывает меню (для мобильных, если нет клавиатуры)
 
   ПОДГОТОВКА (важно):
     Положи в хотбар / рюкзак: Respawn Anchor, Glowstone, Obsidian,
@@ -29,6 +30,8 @@ local function isRunning()
 	return _G.__FILOSOF_RUN_ID == RUN_ID
 end
 
+print("[FILOSOF] Скрипт запущен, загружаюсь... (меню должно появиться сразу; если нет - скинь красную ошибку из консоли F9)")
+
 --// Конфиг --------------------------------------------------------------------
 local CONFIG = {
 	ExpectedPlaceId = 136077426077314,
@@ -40,6 +43,9 @@ local CONFIG = {
 	StepDelay     = 0.12,  -- пауза между шагами внутри цикла
 	ExplodeOffset = 1.4,   -- точка взрыва: у ног цели + смещение ОТ тебя за цель
 	AnchorCharges = 1,     -- сколько раз заряжать якорь светокамнем (1..4)
+	-- Кнопка постановки блоков для кастомного хотбара: nil = автообучение
+	-- (скрипт сам проверит ПКМ/ЛКМ по факту появления блока), 0 = ЛКМ, 1 = ПКМ
+	PlaceButton = nil,
 
 	-- AutoTotem
 	InventoryKey  = Enum.KeyCode.E, -- открыть инвентарь
@@ -79,14 +85,48 @@ local STATE = {
 	OffhandText = "?",
 }
 
---// Сервисы -------------------------------------------------------------------
-local Players           = game:GetService("Players")
-local RunService        = game:GetService("RunService")
-local UserInputService  = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local VirtualInputManager = game:GetService("VirtualInputManager")
+-- Кэш одноразовой самопроверки: скрипт ОДИН РАЗ сканирует игру (как дамп в F9),
+-- запоминает слоты/оффхенд/ремоты и дальше работает по памяти - без постоянных
+-- полных сканирований PlayerGui, от которых были лаги в бою.
+local CACHE = {
+	Diagnosed = false, Diagnosing = false, LastScanAt = 0, AutoScanTries = 0,
+	SlotIndex = {},      -- kind -> номер хотбара 1..9
+	SlotObj = {},        -- kind -> GuiObject хотбара
+	ToolKind = {},       -- kind -> имя Tool (для сводки)
+	TotemInvSlotObj = nil,
+	OffhandSlotObj = nil,
+	OffhandValueObj = nil, -- StringValue/ObjectValue состояния оффхенда
+	OffhandReadable = false,
+	LastSlots = nil, LastSlotsAt = 0,
+	BotModels = {}, BotScanAt = 0,
+}
 
-local LocalPlayer = Players.LocalPlayer
+-- Что скрипт выучил по факту в бою (чтобы не пробовать всё каждый цикл)
+local LEARNED = {
+	PlaceButton = nil,     -- 0=ЛКМ / 1=ПКМ, которой реально ставятся блоки
+	ToolNeedsMouse = false, -- Tool: одного Activate мало, нужен ещё клик мыши
+	LearnTries = 0,
+	TotemMethod = nil,     -- "F" | "InvClick" | "InvDrag"
+}
+
+--// Сервисы (через pcall: недоступный сервис НЕ должен убивать скрипт до GUI) ---
+local function getService(name)
+	local ok, svc = pcall(function() return game:GetService(name) end)
+	return (ok and svc) or nil
+end
+local Players           = getService("Players")
+local RunService        = getService("RunService")
+local UserInputService  = getService("UserInputService")
+local ReplicatedStorage = getService("ReplicatedStorage")
+-- VirtualInputManager в обычном клиенте может быть недоступен без прав экзекьютора.
+-- nil допустим: все его вызовы ниже обёрнуты в pcall и имеют фолбэки.
+local VirtualInputManager = getService("VirtualInputManager")
+
+local LocalPlayer = (Players and Players.LocalPlayer) or nil
+if not LocalPlayer then
+	warn("[FILOSOF] LocalPlayer не найден: скрипт запущен НЕ на клиенте (серверный Script?). Нужен экзекьютор или LocalScript.")
+	return
+end
 
 local DIGIT_KEYS = {
 	Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three,
@@ -156,6 +196,12 @@ local function instanceBlob(inst)
 	end)
 	if inst:IsA("StringValue") then table.insert(parts, inst.Value) end
 	if inst:IsA("ObjectValue") and inst.Value then table.insert(parts, inst.Value.Name) end
+	pcall(function()
+		for _, c in ipairs(inst:GetChildren()) do
+			if c:IsA("StringValue") then table.insert(parts, c.Value)
+			elseif c:IsA("ObjectValue") and c.Value then table.insert(parts, c.Value.Name) end
+		end
+	end)
 	if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
 		if inst.Text ~= "" then table.insert(parts, inst.Text) end
 	end
@@ -359,6 +405,11 @@ local function aimAt(pos)
 	return x, y
 end
 
+local function clickAtWorldButton(pos, button) -- button: 0=ЛКМ, 1=ПКМ
+	local x, y = aimAt(pos)
+	return clickMouseAt(x, y, button)
+end
+
 local function clickAtWorld(pos, mode) -- mode: "Place"/"Interact" = ПКМ, "Hit" = ЛКМ
 	local x, y = aimAt(pos)
 	local button = (mode == "Hit") and 0 or 1
@@ -509,10 +560,31 @@ local function collectGuiSlots()
 	return slots
 end
 
+-- Кэш списка слотов: полный скан PlayerGui делается редко (самопроверка),
+-- а в бою переиспользуется результат не старше maxAge секунд.
+local function getSlotsCached(maxAge)
+	maxAge = maxAge or 2
+	if CACHE.LastSlots and (os.clock() - CACHE.LastSlotsAt) < maxAge then
+		return CACHE.LastSlots
+	end
+	CACHE.LastSlots = collectGuiSlots()
+	CACHE.LastSlotsAt = os.clock()
+	return CACHE.LastSlots
+end
+
+local function cacheSlotMapping(kind, slot)
+	if not slot then return end
+	if slot.Index and slot.Index >= 1 and slot.Index <= 9 then
+		CACHE.SlotIndex[kind] = slot.Index
+	end
+	CACHE.SlotObj[kind] = slot.Obj
+end
+
 local function findHotbarSlot(kind)
-	for _, s in ipairs(collectGuiSlots()) do
-		if s.IsHotbar and not s.IsOffhand and textMatchesKind(s.Blob, kind) then
-			return s
+	for _, sl in ipairs(getSlotsCached(2)) do
+		if sl.IsHotbar and not sl.IsOffhand and textMatchesKind(sl.Blob, kind) then
+			cacheSlotMapping(kind, sl)
+			return sl
 		end
 	end
 	return nil
@@ -520,19 +592,19 @@ end
 
 local function findAnySlot(kind)
 	local bestInventory, bestHotbar = nil, nil
-	for _, s in ipairs(collectGuiSlots()) do
-		if not s.IsOffhand and textMatchesKind(s.Blob, kind) then
-			if s.IsInventory and not bestInventory then bestInventory = s end
-			if s.IsHotbar and not bestHotbar then bestHotbar = s end
+	for _, sl in ipairs(getSlotsCached(2)) do
+		if not sl.IsOffhand and textMatchesKind(sl.Blob, kind) then
+			if sl.IsInventory and not bestInventory then bestInventory = sl end
+			if sl.IsHotbar and not bestHotbar then bestHotbar = sl end
 		end
 	end
 	return bestInventory or bestHotbar
 end
 
 local function findOffhandSlot(slots)
-	slots = slots or collectGuiSlots()
-	for _, s in ipairs(slots) do
-		if s.IsOffhand then return s end
+	slots = slots or getSlotsCached(2)
+	for _, sl in ipairs(slots) do
+		if sl.IsOffhand then return sl end
 	end
 	-- прямой поиск: GuiObject с offhand/lefthand в имени, самый маленький по площади
 	local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -556,29 +628,44 @@ end
 --// Выбор предмета в руку -------------------------------------------------------
 -- Возвращает ok, источник ("tool"|"hotbar"), tool?
 local function selectItem(kind)
-	-- 1) настоящий Tool
+	-- 1) настоящий Tool (дёшево: только дети Character/Backpack)
 	local tool = findTool(kind)
 	if tool then
 		if equipTool(tool) then return true, "tool", tool end
 	end
-	-- 2) ручной слот хотбара
+	-- 2) ручной слот хотбара из GUI/конфига
 	local manual = CONFIG.ManualHotbarSlots[kind] or 0
 	if manual >= 1 and manual <= 9 then
-		pressDigit(manual)
-		task.wait(0.05)
-		return true, "hotbar", nil
+		if pressDigit(manual) then
+			task.wait(0.04)
+			return true, "hotbar", nil
+		end
 	end
-	-- 3) автопоиск по GUI хотбару
+	-- 3) КЭШ самопроверки: сначала цифра, потом клик по запомненному слоту.
+	--    Никакого скана PlayerGui в бою.
+	local cachedIndex = CACHE.SlotIndex[kind]
+	if cachedIndex and cachedIndex >= 1 and cachedIndex <= 9 then
+		if pressDigit(cachedIndex) then
+			task.wait(0.04)
+			return true, "hotbar", nil
+		end
+	end
+	local cachedObj = CACHE.SlotObj[kind]
+	if cachedObj and cachedObj.Parent then
+		if clickGuiObject(cachedObj) then
+			task.wait(0.04)
+			return true, "hotbar", nil
+		end
+	end
+	-- 4) кэша нет - один поиск по кэшированному списку слотов (скан не чаще раза в 2 сек)
 	local slot = findHotbarSlot(kind)
 	if slot then
-		if slot.Index and slot.Index >= 1 and slot.Index <= 9 then
-			if pressDigit(slot.Index) then
-				task.wait(0.05)
-				return true, "hotbar", nil
-			end
+		if slot.Index and slot.Index >= 1 and slot.Index <= 9 and pressDigit(slot.Index) then
+			task.wait(0.04)
+			return true, "hotbar", nil
 		end
 		if clickGuiObject(slot.Obj) then
-			task.wait(0.05)
+			task.wait(0.04)
 			return true, "hotbar", nil
 		end
 	end
@@ -586,21 +673,27 @@ local function selectItem(kind)
 end
 
 -- Использовать предмет kind по мировой точке. mode: Place / Interact / Hit
+-- Возвращает ok, источник, использованную кнопку мыши (nil, если хватило Tool:Activate)
 local function useItemAt(kind, pos, mode)
 	local ok, source, tool = selectItem(kind)
 	if not ok then return false end
+	-- целимся дважды и кликаем СРАЗУ после второго прицела: контроллер камеры
+	-- успевал вернуть камеру назад за паузу, из-за чего блоки ставились мимо
+	aimAt(pos)
+	task.wait(0.03)
 	local x, y = aimAt(pos)
-	task.wait(0.04)
+	local usedButton = nil
 	if source == "tool" and tool then
 		pcall(function() tool:Activate() end)
-		if STATE.ExtraMouseClick then
-			clickMouseAt(x, y, (mode == "Hit") and 0 or 1)
+		if STATE.ExtraMouseClick or LEARNED.ToolNeedsMouse then
+			usedButton = (mode == "Hit") and 0 or (LEARNED.PlaceButton or CONFIG.PlaceButton or 1)
+			clickMouseAt(x, y, usedButton)
 		end
 	else
-		-- кастомный хотбар в стиле Minecraft: поставить/использовать = ПКМ, ударить = ЛКМ
-		clickMouseAt(x, y, (mode == "Hit") and 0 or 1)
+		usedButton = (mode == "Hit") and 0 or (LEARNED.PlaceButton or CONFIG.PlaceButton or 1)
+		clickMouseAt(x, y, usedButton)
 	end
-	return true
+	return true, source, usedButton
 end
 
 -- Клик "пустой рукой" (если оружия нет): Tool убираем, кликаем мышью
@@ -649,35 +742,41 @@ local function findNearestTarget()
 			if not sameTeam then consider(plr.Character, plr.Name) end
 		end
 	end
-	-- боты / NPC-соперники: модели-мобы прямо в Workspace с Humanoid
-	for _, child in ipairs(workspace:GetChildren()) do
-		if child:IsA("Model") and child ~= myChar() and getHum(child) and getRoot(child) then
-			local isPlayerChar = Players:GetPlayerFromCharacter(child) ~= nil
-			if not isPlayerChar then
-				local n = normalize(child.Name)
-				if not (string.find(n, "npc", 1, true) or string.find(n, "shop", 1, true)
-					or string.find(n, "dummy", 1, true)) then
-					consider(child, child.Name)
+	-- боты: список моделей Workspace обновляем раз в 1.5 сек, а не каждый вызов
+	if os.clock() - CACHE.BotScanAt > 1.5 then
+		CACHE.BotScanAt = os.clock()
+		local bots = {}
+		for _, child in ipairs(workspace:GetChildren()) do
+			if child:IsA("Model") and child ~= myChar() and getHum(child) and getRoot(child) then
+				if Players:GetPlayerFromCharacter(child) == nil then
+					local n = normalize(child.Name)
+					if not (string.find(n, "npc", 1, true) or string.find(n, "shop", 1, true)
+						or string.find(n, "dummy", 1, true)) then
+						table.insert(bots, child)
+					end
 				end
 			end
 		end
+		CACHE.BotModels = bots
+	end
+	for _, bot in ipairs(CACHE.BotModels) do
+		if bot.Parent then consider(bot, bot.Name) end
 	end
 	return best, bestDist
 end
 
 --// Позиции: земля, точка взрыва, поставленные объекты --------------------------
-local function groundPosition(fromPos)
+local function groundPosition(fromPos, ignoreModel)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	local exclude = {}
 	for _, plr in ipairs(Players:GetPlayers()) do
 		if plr.Character then table.insert(exclude, plr.Character) end
 	end
-	for _, child in ipairs(workspace:GetChildren()) do
-		if child:IsA("Model") and child:FindFirstChildOfClass("Humanoid") then
-			table.insert(exclude, child)
-		end
+	for _, bot in ipairs(CACHE.BotModels) do
+		if bot.Parent then table.insert(exclude, bot) end
 	end
+	if ignoreModel then table.insert(exclude, ignoreModel) end
 	params.FilterDescendantsInstances = exclude
 	local origin = fromPos + Vector3.new(0, 3, 0)
 	local hit = workspace:Raycast(origin, Vector3.new(0, -14, 0), params)
@@ -690,7 +789,7 @@ end
 local function getPlacePosition(targetModel)
 	local tRoot, mRoot = getRoot(targetModel), myRoot()
 	if not tRoot then return nil end
-	local foot = groundPosition(tRoot.Position)
+	local foot = groundPosition(tRoot.Position, targetModel)
 	if not mRoot then return foot end
 	local flat = Vector3.new(tRoot.Position.X - mRoot.Position.X, 0, tRoot.Position.Z - mRoot.Position.Z)
 	if flat.Magnitude < 0.05 then
@@ -698,7 +797,7 @@ local function getPlacePosition(targetModel)
 	end
 	flat = flat.Unit
 	local candidate = Vector3.new(foot.X + flat.X * CONFIG.ExplodeOffset, foot.Y + 2.5, foot.Z + flat.Z * CONFIG.ExplodeOffset)
-	return groundPosition(candidate)
+	return groundPosition(candidate, targetModel)
 end
 
 local function instancePosition(inst)
@@ -714,17 +813,25 @@ local function findPlaced(kind, nearPos, radius)
 		local op = OverlapParams.new()
 		op.FilterType = Enum.RaycastFilterType.Exclude
 		op.FilterDescendantsInstances = myChar() and { myChar() } or {}
-		op.MaxParts = 200
+		op.MaxParts = 80
 		return workspace:GetPartBoundsInRadius(nearPos, radius, op)
 	end)
 	if not ok or not parts then return nil end
 	local bestPos, bestDist = nil, math.huge
+	local checked = {} -- один предок у многих партов: не дёргать GetAttributes повторно
 	for _, part in ipairs(parts) do
 		local cur, inTool, matched = part, false, nil
 		for _ = 1, 5 do
 			if not cur then break end
 			if cur:IsA("Tool") then inTool = true break end
-			if not matched and instanceMatchesKind(cur, kind) then matched = cur end
+			if not matched then
+				local prev = checked[cur]
+				if prev == nil then
+					prev = instanceMatchesKind(cur, kind)
+					checked[cur] = prev
+				end
+				if prev then matched = cur end
+			end
 			cur = cur.Parent
 		end
 		if matched and not inTool then
@@ -744,6 +851,47 @@ local function canSafelyExplode(pos)
 	local hpFrac = (hum.MaxHealth > 0) and (hum.Health / hum.MaxHealth) or 1
 	if selfDist < 2.5 and hpFrac < 0.35 then return false end
 	return true
+end
+
+-- Поставить блок и ПРОВЕРИТЬ, что он реально появился. Если первая кнопка мыши
+-- не сработала - попробовать другую и запомнить рабочую (LEARNED.PlaceButton).
+local function placeItemAt(kind, pos, placedKind, nearPos)
+	local function isNew(before, after)
+		return after ~= nil and (before == nil or (after - before).Magnitude > 0.6)
+	end
+	-- "до" запрашиваем только пока обучаемся кнопке; потом хватает запроса "после" (меньше нагрузка)
+	local learning = (LEARNED.PlaceButton == nil and CONFIG.PlaceButton == nil)
+	local before = (placedKind and learning) and findPlaced(placedKind, nearPos, 7) or nil
+	local ok, source, usedButton = useItemAt(kind, pos, "Place")
+	if not ok then return false, nil end
+	task.wait(math.max(CONFIG.StepDelay, 0.1))
+	local after = placedKind and findPlaced(placedKind, nearPos, 7) or nil
+	if isNew(before, after) then
+		if LEARNED.PlaceButton == nil and usedButton ~= nil then
+			LEARNED.PlaceButton = usedButton
+		end
+		if source == "tool" and usedButton == nil then LEARNED.ToolNeedsMouse = false end
+		return true, after
+	end
+	-- не появился: пробуем другую кнопку (не больше 3 попыток обучения за сессию)
+	if CONFIG.PlaceButton == nil and LEARNED.PlaceButton == nil and LEARNED.LearnTries < 3 then
+		LEARNED.LearnTries = LEARNED.LearnTries + 1
+		for _, btn in ipairs({ 1, 0 }) do
+			if btn ~= usedButton then
+				clickAtWorldButton(pos, btn)
+				task.wait(0.12)
+				after = placedKind and findPlaced(placedKind, nearPos, 7) or nil
+				if isNew(before, after) then
+					LEARNED.PlaceButton = btn
+					if source == "tool" then LEARNED.ToolNeedsMouse = true end
+					Log("Автообучение: блоки ставятся кнопкой " .. (btn == 1 and "ПКМ" or "ЛКМ"))
+					return true, after
+				end
+			end
+		end
+		LogThrottled("placenone", kind .. ": клик ушёл, но блок не появился рядом с целью (целься/подойди ближе, проверь слот в самопроверке)", 5)
+	end
+	return true, after
 end
 
 --// AutoCrystal: цикл якоря + кристалла -----------------------------------------
@@ -769,9 +917,9 @@ local function doAutoCrystalCycle()
 
 	--=== Якорь возрождения: поставить -> зарядить светокамнем -> взорвать ======
 	if STATE.UseAnchors then
-		if useItemAt("Anchor", placePos, "Place") then
-			task.wait(CONFIG.StepDelay)
-			local anchorPos = findPlaced("Anchor", tRoot.Position, 7) or placePos
+		local anchorOk, anchorFound = placeItemAt("Anchor", placePos, "Anchor", tRoot.Position)
+		if anchorOk then
+			local anchorPos = anchorFound or placePos
 			local charged = false
 			for _ = 1, math.max(1, CONFIG.AnchorCharges) do
 				if useItemAt("Glowstone", anchorPos, "Place") then charged = true end
@@ -801,14 +949,13 @@ local function doAutoCrystalCycle()
 		local mRoot = myRoot()
 		if tRoot and mRoot and (tRoot.Position - mRoot.Position).Magnitude <= CONFIG.PlaceRange then
 			placePos = getPlacePosition(target) or placePos
-			if useItemAt("Obsidian", placePos, "Place") then
-				task.wait(CONFIG.StepDelay)
-				local obsPos = findPlaced("Obsidian", tRoot.Position, 7) or placePos
+			local obsOk, obsFound = placeItemAt("Obsidian", placePos, "Obsidian", tRoot.Position)
+			if obsOk then
+				local obsPos = obsFound or placePos
 				local crystalAim = obsPos + Vector3.new(0, 1.2, 0) -- верхняя грань обсидиана
-				if useItemAt("Crystal", crystalAim, "Place") then
-					task.wait(CONFIG.StepDelay)
-					local crystalPos = findPlaced("Crystal", tRoot.Position, 7)
-						or (obsPos + Vector3.new(0, 2, 0))
+				local crystalOk, crystalFound = placeItemAt("Crystal", crystalAim, "Crystal", tRoot.Position)
+				if crystalOk then
+					local crystalPos = crystalFound or (obsPos + Vector3.new(0, 2, 0))
 					if canSafelyExplode(crystalPos) then
 						if not useItemAt("Weapon", crystalPos, "Hit") then
 							useHandAt(crystalPos, "Hit")
@@ -832,69 +979,61 @@ end
 --// AutoTotem -------------------------------------------------------------------
 -- true = тотем в оффхенде, false = точно нет, nil = не удалось определить
 local function isOffhandTotem()
-	-- 1) атрибуты Offhand у игрока/персонажа
 	local char = myChar()
+	-- 1) запомненный самопроверкой Value-объект оффхенда (самое надёжное и дешёвое)
+	local vobj = CACHE.OffhandValueObj
+	if vobj and vobj.Parent then
+		if vobj:IsA("StringValue") then
+			if textMatchesKind(vobj.Value, "Totem") then return true end
+			if vobj.Value ~= "" then return false end
+		elseif vobj:IsA("ObjectValue") then
+			if vobj.Value then return instanceMatchesKind(vobj.Value, "Totem") end
+			return false
+		end
+	end
+	-- 2) атрибуты только у двух инстансов (игрок и персонаж), без GetDescendants
 	for _, holder in ipairs({ LocalPlayer, char }) do
 		if holder then
 			local ok, attrs = pcall(function() return holder:GetAttributes() end)
 			if ok and attrs then
 				for k, v in pairs(attrs) do
 					local nk = normalize(tostring(k))
-					if string.find(nk, "offhand", 1, true) or string.find(nk, "lefthand", 1, true) then
-						if type(v) == "string" then
-							if textMatchesKind(v, "Totem") then return true end
-							if v ~= "" then return false end
-						end
-					end
-				end
-			end
-			-- Value-объекты Offhand
-			for _, d in ipairs(holder:GetDescendants()) do
-				local nd = normalize(d.Name)
-				if string.find(nd, "offhand", 1, true) then
-					if d:IsA("StringValue") then
-						if textMatchesKind(d.Value, "Totem") then return true end
-						if d.Value ~= "" then return false end
-					elseif d:IsA("ObjectValue") and d.Value then
-						return instanceMatchesKind(d.Value, "Totem")
+					if (string.find(nk, "offhand", 1, true) or string.find(nk, "lefthand", 1, true)) and type(v) == "string" then
+						if textMatchesKind(v, "Totem") then return true end
+						if v ~= "" then return false end
 					end
 				end
 			end
 		end
 	end
-	-- 2) предмет в левой руке персонажа
+	-- 3) левая рука персонажа (поддерево маленькое)
 	if char then
 		local leftHand = char:FindFirstChild("LeftHand") or char:FindFirstChild("Left Arm")
 		if leftHand then
 			for _, d in ipairs(leftHand:GetDescendants()) do
 				if instanceMatchesKind(d, "Totem") then return true end
 			end
-			for _, d in ipairs(char:GetDescendants()) do
-				local nd = normalize(d.Name)
-				if string.find(nd, "offhand", 1, true) and instanceMatchesKind(d, "Totem") then
-					return true
-				end
-			end
 		end
 	end
-	-- 3) слот оффхенда в GUI
-	local slot = findOffhandSlot()
-	if slot then
-		if textMatchesKind(slot.Blob or guiSlotBlob(slot.Obj), "Totem") then return true end
+	-- 4) запомненный GUI-слот оффхенда: смотрим только его, а не весь PlayerGui
+	local slotObj = CACHE.OffhandSlotObj
+	if slotObj and slotObj.Parent then
+		if textMatchesKind(guiSlotBlob(slotObj), "Totem") then return true end
 		local hasIcon = false
-		for _, d in ipairs(slot.Obj:GetDescendants()) do
-			if d:IsA("ImageLabel") or d:IsA("ImageButton") then
-				if d.Image ~= "" and d.Visible then hasIcon = true end
+		for _, d in ipairs(slotObj:GetDescendants()) do
+			if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Image ~= "" and d.Visible then
+				hasIcon = true
+				break
 			end
 		end
-		if hasIcon then return nil end -- что-то лежит, но не опознано по имени
+		if hasIcon then return nil end -- чтото лежит, но по имени не опознано
 		return false
 	end
-	return nil
+	return nil -- не знаю: самопроверка ещё не нашла, чем читать оффхенд (сканирует сторожевой цикл, не этот)
 end
 
 local function inventoryIsOpen(slots)
-	slots = slots or collectGuiSlots()
+	slots = slots or getSlotsCached(2)
 	for _, s in ipairs(slots) do
 		if s.IsInventory and s.Visible then return true end
 	end
@@ -907,13 +1046,17 @@ local function swapTotemNow()
 	STATE.LastTotemAttempt = now
 	local prevTool = getEquippedTool()
 
-	-- Попытка 1: взять тотем в руку и нажать F (как в Minecraft)
-	local okSel, selSource = selectItem("Totem")
+	-- Попытка 1: взять тотем в руку и нажать F (как в Minecraft).
+	-- Если прошлый свап сработал через инвентарь - F больше не дёргаем.
+	local skipF = (LEARNED.TotemMethod ~= nil and LEARNED.TotemMethod ~= "F")
+	local okSel, selSource = false, nil
+	if not skipF then okSel, selSource = selectItem("Totem") end
 	if okSel then
 		sendKey(CONFIG.SwapHandsKey, 0x46) -- F
 		task.wait(0.18)
 		local state = isOffhandTotem()
 		if state == true then
+			LEARNED.TotemMethod = "F"
 			restoreWeapon(prevTool)
 			Log("AutoTotem: тотем в оффхенде (свап по F)")
 			return true
@@ -921,48 +1064,68 @@ local function swapTotemNow()
 		-- тотем исчез из руки после F - значит свап сработал, даже если оффхенд не читается
 		local eq = getEquippedTool()
 		if state == nil and selSource == "tool" and (not eq or not instanceMatchesKind(eq, "Totem")) then
+			LEARNED.TotemMethod = "F"
 			restoreWeapon(prevTool)
 			Log("AutoTotem: свап по F выполнен (статус оффхенда не читается)")
 			return true
 		end
-	else
+	elseif not skipF then
 		LogThrottled("totemsel", "AutoTotem: тотем не найден ни Tool-ом, ни в хотбаре - пробую инвентарь", 4)
 	end
 
 	-- Попытка 2: инвентарь - клик по тотему, клик по слоту оффхенда
-	local slots = collectGuiSlots()
+	local slots = getSlotsCached(2)
 	local openedByUs = false
+	local openedViaButton = false
 	if not inventoryIsOpen(slots) then
 		sendKey(CONFIG.InventoryKey, 0x45) -- E
 		openedByUs = true
 		task.wait(0.3)
-		slots = collectGuiSlots()
+		slots = collectGuiSlots() -- после открытия инвентаря нужен свежий список (это редко, не в бою каждый кадр)
+		CACHE.LastSlots, CACHE.LastSlotsAt = slots, os.clock()
+		-- E не сработала (телефон?) - пробуем экранную кнопку инвентаря из самопроверки
+		if not inventoryIsOpen(slots) and CACHE.InventoryButtonObj and CACHE.InventoryButtonObj.Parent then
+			clickGuiObject(CACHE.InventoryButtonObj)
+			openedViaButton = true
+			task.wait(0.3)
+			slots = collectGuiSlots()
+			CACHE.LastSlots, CACHE.LastSlotsAt = slots, os.clock()
+		end
 	end
 	local totemSlot, offhandSlot = nil, nil
 	for _, s in ipairs(slots) do
 		if s.IsOffhand then offhandSlot = s end
 		if not s.IsOffhand and textMatchesKind(s.Blob, "Totem") and not totemSlot then totemSlot = s end
 	end
+	if not totemSlot and CACHE.TotemInvSlotObj and CACHE.TotemInvSlotObj.Parent then
+		totemSlot = { Obj = CACHE.TotemInvSlotObj }
+	end
+	if not offhandSlot and CACHE.OffhandSlotObj and CACHE.OffhandSlotObj.Parent then
+		offhandSlot = { Obj = CACHE.OffhandSlotObj }
+	end
 	offhandSlot = offhandSlot or findOffhandSlot(slots)
+	if totemSlot then CACHE.TotemInvSlotObj = totemSlot.Obj end
+	if offhandSlot then CACHE.OffhandSlotObj = offhandSlot.Obj end
 
 	local success = false
+	local successMethod = nil
 	if totemSlot and offhandSlot then
 		clickGuiObject(totemSlot.Obj)
 		task.wait(0.12)
 		clickGuiObject(offhandSlot.Obj)
 		task.wait(0.2)
 		if isOffhandTotem() == true then
-			success = true
+			success, successMethod = true, "InvClick"
 		else
 			-- если слот тотема опустел - клики сработали; если тотем всё ещё там - пробуем драгу
 			local stillTotem = guiSlotMatchesKind(totemSlot.Obj, "Totem")
 			if not stillTotem then
-				success = true
+				success, successMethod = true, "InvClick"
 			else
 				dragGuiObject(totemSlot.Obj, offhandSlot.Obj)
 				task.wait(0.2)
 				if isOffhandTotem() == true or not guiSlotMatchesKind(totemSlot.Obj, "Totem") then
-					success = true
+					success, successMethod = true, "InvDrag"
 				end
 			end
 		end
@@ -970,12 +1133,18 @@ local function swapTotemNow()
 		LogThrottled("totemgui", "AutoTotem: не найден слот тотема/оффхенда в GUI. Нажми Дамп (F9) и пришли вывод.", 5)
 	end
 
-	if openedByUs then
+	if openedViaButton and CACHE.InventoryButtonObj and CACHE.InventoryButtonObj.Parent then
+		clickGuiObject(CACHE.InventoryButtonObj)
+		task.wait(0.1)
+	elseif openedByUs then
 		sendKey(CONFIG.InventoryKey, 0x45)
 		task.wait(0.1)
 	end
 	restoreWeapon(prevTool)
-	if success then Log("AutoTotem: тотем перенесён в левую руку через инвентарь") end
+	if success then
+		LEARNED.TotemMethod = successMethod or LEARNED.TotemMethod
+		Log("AutoTotem: тотем перенесён в левую руку через инвентарь")
+	end
 	return success
 end
 
@@ -993,6 +1162,202 @@ local function autoTotemTick()
 	local cooldown = (state == nil) and 2.5 or 0.6
 	if os.clock() - STATE.LastTotemAttempt < cooldown then return end
 	swapTotemNow()
+end
+
+--// Самопроверка: ОДИН раз сканирует игру и заполняет CACHE -----------------------
+-- Полный вывод идёт в консоль (F9), короткая сводка - в лог GUI.
+-- quiet=true: тихий повторный скан сторожевым циклом (без спама в консоль).
+local function runSelfDiagnostics(force, reason, quiet)
+	if CACHE.Diagnosing then return end
+	if CACHE.Diagnosed and not force then return end
+	CACHE.Diagnosing = true
+	local function out(t) if not quiet then print("[FILOSOF-CHECK] " .. tostring(t)) end end
+	local ok, err = pcall(function()
+		out("=== Самопроверка (" .. tostring(reason or "старт") .. ") PlaceId=" .. tostring(game.PlaceId) .. " ===")
+		local char = myChar()
+
+		-- Tools
+		local toolNames = {}
+		local function scanTools(container)
+			if not container then return end
+			for _, c in ipairs(container:GetChildren()) do
+				if c:IsA("Tool") then table.insert(toolNames, c.Name) end
+			end
+		end
+		scanTools(char)
+		scanTools(LocalPlayer:FindFirstChildOfClass("Backpack"))
+		out("Tools: " .. (#toolNames > 0 and table.concat(toolNames, ", ") or "нет (игра на кастомном хотбаре)"))
+
+		-- GUI слоты (единственный полный скан PlayerGui)
+		local slots = collectGuiSlots()
+		CACHE.LastSlots, CACHE.LastSlotsAt = slots, os.clock()
+		local hotCount = 0
+		for _, sl in ipairs(slots) do
+			if sl.IsHotbar then
+				hotCount = hotCount + 1
+				out(string.format("HOT idx=%s blob=%s", tostring(sl.Index), string.sub(sl.Blob, 1, 120)))
+			end
+		end
+		out("Слотов всего: " .. tostring(#slots) .. ", хотбар: " .. tostring(hotCount))
+
+		-- Карта предметов -> слоты/Tool
+		local kinds = { "Anchor", "Glowstone", "Obsidian", "Crystal", "Totem", "Weapon" }
+		for _, kind in ipairs(kinds) do
+			local tool = findTool(kind)
+			CACHE.ToolKind[kind] = tool and tool.Name or nil
+			for _, sl in ipairs(slots) do
+				if sl.IsHotbar and not sl.IsOffhand and textMatchesKind(sl.Blob, kind) then
+					cacheSlotMapping(kind, sl)
+					break
+				end
+			end
+		end
+		-- слот тотема в инвентаре и слот оффхенда
+		for _, sl in ipairs(slots) do
+			if not sl.IsOffhand and textMatchesKind(sl.Blob, "Totem") then
+				if sl.IsInventory or not CACHE.TotemInvSlotObj then CACHE.TotemInvSlotObj = sl.Obj end
+			end
+		end
+		-- экранная кнопка инвентаря (на телефоне нет клавиши E)
+		CACHE.InventoryButtonObj = nil
+		do
+			local pg2 = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+			if pg2 then
+				local bestB, bestBArea = nil, math.huge
+				for _, d in ipairs(pg2:GetDescendants()) do
+					if d:IsA("GuiButton") then
+						local nb = normalize(instanceBlob(d))
+						if string.find(nb, "inventory", 1, true) or string.find(nb, "invbutton", 1, true) then
+							local area = d.AbsoluteSize.X * d.AbsoluteSize.Y
+							if area > 0 and area < bestBArea then bestB, bestBArea = d, area end
+						end
+					end
+				end
+				if bestB then
+					CACHE.InventoryButtonObj = bestB
+					out("Кнопка инвентаря: " .. bestB:GetFullName())
+				end
+			end
+		end
+
+		local off = findOffhandSlot(slots)
+		if off then
+			CACHE.OffhandSlotObj = off.Obj
+			CACHE.OffhandReadable = true
+			out("Offhand GUI: " .. off.Obj:GetFullName())
+		else
+			out("Offhand GUI: НЕ НАЙДЕН")
+		end
+
+		-- Value-объект/атрибуты оффхенда (один раз, дальше читаем напрямую)
+		CACHE.OffhandValueObj = nil
+		for _, holder in ipairs({ LocalPlayer, char }) do
+			if holder and not CACHE.OffhandValueObj then
+				local okA, attrs = pcall(function() return holder:GetAttributes() end)
+				if okA and attrs then
+					for k, _ in pairs(attrs) do
+						local nk = normalize(tostring(k))
+						if string.find(nk, "offhand", 1, true) or string.find(nk, "lefthand", 1, true) then
+							CACHE.OffhandReadable = true
+							out("Offhand атрибут: " .. tostring(k) .. " у " .. holder.Name)
+						end
+					end
+				end
+				for _, d in ipairs(holder:GetDescendants()) do
+					local nd = normalize(d.Name)
+					if (string.find(nd, "offhand", 1, true) or string.find(nd, "lefthand", 1, true))
+						and (d:IsA("StringValue") or d:IsA("ObjectValue")) then
+						CACHE.OffhandValueObj = d
+						CACHE.OffhandReadable = true
+						out("Offhand Value: " .. d:GetFullName())
+						break
+					end
+				end
+			end
+		end
+
+		-- Ремоты, похожие на постановку/инвентарь (для будущей точной подгонки)
+		if ReplicatedStorage then
+			local words = { "place", "block", "crystal", "anchor", "inventory", "offhand", "swap", "equip", "interact", "useitem" }
+			local total, shown = 0, 0
+			for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+				if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+					total = total + 1
+					local nd = normalize(d.Name)
+					for _, w in ipairs(words) do
+						if string.find(nd, w, 1, true) then
+							if shown < 60 then out("Remote?: " .. d.ClassName .. " " .. d:GetFullName()) end
+							shown = shown + 1
+							break
+						end
+					end
+				end
+			end
+			out("Ремотов всего: " .. tostring(total) .. ", похожих на предметы: " .. tostring(shown))
+		end
+
+		local function kindText(kind)
+			if CACHE.ToolKind[kind] then return "Tool:" .. CACHE.ToolKind[kind] end
+			local m = CONFIG.ManualHotbarSlots[kind] or 0
+			if m > 0 then return "ручной слот " .. tostring(m) end
+			if CACHE.SlotIndex[kind] then return "слот " .. tostring(CACHE.SlotIndex[kind]) end
+			if CACHE.SlotObj[kind] then return "GUI-клик" end
+			return "НЕ НАЙДЕН"
+		end
+		local summary = string.format("Anchor=%s | Glow=%s | Obs=%s | Crystal=%s | Totem=%s | Weapon=%s",
+			kindText("Anchor"), kindText("Glowstone"), kindText("Obsidian"),
+			kindText("Crystal"), kindText("Totem"), kindText("Weapon"))
+		out(summary)
+		out("Оффхенд читается: " .. tostring(CACHE.OffhandReadable) .. " | Кнопка постановки: "
+			.. (LEARNED.PlaceButton and (LEARNED.PlaceButton == 1 and "ПКМ" or "ЛКМ") or "ещё не выучена (выясню при первой постановке)"))
+		Log("Самопроверка готова (" .. tostring(reason or "") .. "): " .. summary)
+	end)
+	if not ok then warn("[FILOSOF] Самопроверка упала: " .. tostring(err)) end
+	CACHE.Diagnosed = true
+	CACHE.LastScanAt = os.clock()
+	CACHE.Diagnosing = false
+end
+
+local function kindAvailable(kind)
+	if findTool(kind) then return true end
+	if (CONFIG.ManualHotbarSlots[kind] or 0) > 0 then return true end
+	if CACHE.SlotIndex[kind] then return true end
+	local obj = CACHE.SlotObj[kind]
+	return obj ~= nil and obj.Parent ~= nil
+end
+
+-- Чего не хватает включённым функциям? (сторожевой цикл досканирует тихо и редко)
+local function needsDiagnosis()
+	if STATE.AutoCrystal then
+		local need = { "Anchor", "Glowstone" }
+		if STATE.UseCrystals then table.insert(need, "Obsidian") table.insert(need, "Crystal") end
+		for _, kind in ipairs(need) do
+			if not kindAvailable(kind) then return true end
+		end
+	end
+	if STATE.AutoTotem then
+		if not kindAvailable("Totem") then return true end
+		if not CACHE.OffhandReadable then return true end
+	end
+	return false
+end
+
+local function ensureDiagnostics(reason)
+	if CACHE.Diagnosing then return end
+	if not CACHE.Diagnosed then
+		task.spawn(function() runSelfDiagnostics(false, reason or "нужна") end)
+		return
+	end
+	-- самопроверка уже была, но кит могли выдать позже (дуэль началась после лобби):
+	-- при включении функции тихо пересканировать, если чего-то не хватает
+	task.spawn(function()
+		local need = false
+		pcall(function() need = needsDiagnosis() end)
+		if need and (os.clock() - CACHE.LastScanAt > 2) then
+			runSelfDiagnostics(true, reason or "кит обновился", true)
+			Log("Самопроверка обновила кэш слотов (кит найден после старта)")
+		end
+	end)
 end
 
 --// Дамп для точной подгонки под игру (кнопка в GUI, вывод - F9) -----------------
@@ -1049,22 +1414,43 @@ end
 local GUI_NAME = "FilosofKitPvPTester"
 
 local guiParent = nil
+local guiFallbackParents = {}
 do
+	-- Сначала PlayerGui: он рисуется в ЛЮБОМ окружении (Studio, ПК/телефон экзекьюторы).
+	-- gethui() у части экзекьюторов возвращает контейнер, где ScreenGui не виден -
+	-- поэтому теперь это только запасной вариант, а не основной.
+	local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then
+		local ok, res = pcall(function() return LocalPlayer:WaitForChild("PlayerGui", 8) end)
+		if ok then playerGui = res end
+	end
+	if playerGui then table.insert(guiFallbackParents, playerGui) end
+
 	local gethui = getGlobal("gethui")
 	if gethui then
 		local ok, res = pcall(gethui)
-		if ok and res then guiParent = res end
+		if ok and res and res ~= playerGui then table.insert(guiFallbackParents, res) end
 	end
-	if not guiParent then
-		guiParent = LocalPlayer:WaitForChild("PlayerGui")
+
+	local coreGui = getService("CoreGui")
+	if coreGui then
+		local already = false
+		for _, c in ipairs(guiFallbackParents) do if c == coreGui then already = true end end
+		if not already then table.insert(guiFallbackParents, coreGui) end
 	end
+
+	guiParent = guiFallbackParents[1]
 end
--- убрать старое GUI
-for _, holder in ipairs({ guiParent, LocalPlayer:FindFirstChildOfClass("PlayerGui") }) do
-	if holder then
+if not guiParent then
+	warn("[FILOSOF] Не нашёл, куда повесить GUI (нет PlayerGui/gethui/CoreGui). Скинь консоль F9.")
+	return
+end
+-- убрать старое GUI из всех возможных мест
+for _, holder in ipairs(guiFallbackParents) do
+	pcall(function()
 		local old = holder:FindFirstChild(GUI_NAME)
 		if old then old:Destroy() end
-	end
+	end)
 end
 
 local function create(className, props, parent)
@@ -1072,7 +1458,14 @@ local function create(className, props, parent)
 	for k, v in pairs(props or {}) do
 		pcall(function() obj[k] = v end)
 	end
-	if parent then obj.Parent = parent end
+	if parent then
+		local okParent = pcall(function() obj.Parent = parent end)
+		if not okParent and className == "ScreenGui" then
+			for _, cand in ipairs(guiFallbackParents) do
+				if pcall(function() obj.Parent = cand end) then break end
+			end
+		end
+	end
 	return obj
 end
 
@@ -1089,16 +1482,19 @@ local COLORS = {
 }
 
 local screenGui = create("ScreenGui", {
-	Name = GUI_NAME, ResetOnSpawn = false, DisplayOrder = 999,
+	Name = GUI_NAME, ResetOnSpawn = false, DisplayOrder = 999, Enabled = true,
 	IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, guiParent)
+pcall(function()
+	Log("GUI создан в: " .. tostring(screenGui.Parent and screenGui.Parent:GetFullName() or "??? (нет родителя!)"))
+end)
 
--- Плавающая кнопка открытия (видно, когда GUI закрыто)
+-- Плавающая кнопка открытия: видна ВСЕГДА, слева вверху под топбаром
 local openButton = create("TextButton", {
 	Name = "OpenButton", Text = "F", Font = Enum.Font.GothamBlack, TextSize = 22,
 	TextColor3 = Color3.fromRGB(20, 20, 20), BackgroundColor3 = COLORS.Accent,
-	Size = UDim2.new(0, 46, 0, 46), Position = UDim2.new(0, 14, 0.5, -23),
-	Visible = false, AutoButtonColor = true,
+	Size = UDim2.new(0, 46, 0, 46), Position = UDim2.new(0, 14, 0, 84),
+	Visible = true, AutoButtonColor = true,
 }, screenGui)
 create("UICorner", { CornerRadius = UDim.new(1, 0) }, openButton)
 create("UIStroke", { Color = Color3.fromRGB(0, 0, 0), Thickness = 2 }, openButton)
@@ -1111,6 +1507,17 @@ local main = create("Frame", {
 }, screenGui)
 create("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
 create("UIStroke", { Color = COLORS.Accent, Thickness = 1.5 }, main)
+-- не давать окну уехать за края на телефоне / маленьком окне
+pcall(function()
+	local cam = workspace.CurrentCamera
+	if cam then
+		local vs = cam.ViewportSize
+		local w = math.min(348, math.max(280, vs.X - 16))
+		local h = math.min(470, math.max(300, vs.Y - 70))
+		main.Size = UDim2.new(0, w, 0, h)
+		main.Position = UDim2.new(0.5, -w / 2, 0.5, -h / 2)
+	end
+end)
 
 local titleBar = create("Frame", {
 	Name = "TitleBar", BackgroundColor3 = COLORS.Title, BorderSizePixel = 0,
@@ -1126,7 +1533,7 @@ create("TextLabel", {
 }, titleBar)
 
 create("TextLabel", {
-	Text = "RightShift", Font = Enum.Font.Gotham, TextSize = 11,
+	Text = "RShift/K", Font = Enum.Font.Gotham, TextSize = 11,
 	TextColor3 = COLORS.SubText, BackgroundTransparency = 1,
 	Size = UDim2.new(0, 54, 1, 0), Position = UDim2.new(1, -88, 0, 0),
 }, titleBar)
@@ -1260,10 +1667,16 @@ end
 
 --=== Наполнение меню =============================================================
 addSection("⚔  COMBAT")
-addToggle("AutoCrystal (якоря + кристаллы)", false, function(v) STATE.AutoCrystal = v end)
+addToggle("AutoCrystal (якоря + кристаллы)", false, function(v)
+	STATE.AutoCrystal = v
+	if v then CACHE.AutoScanTries = 0 ensureDiagnostics("включён AutoCrystal") end
+end)
 addToggle("Использовать якори возрождения", true, function(v) STATE.UseAnchors = v end)
 addToggle("Использовать кристаллы Края", true, function(v) STATE.UseCrystals = v end)
-addToggle("AutoTotem (тотем в левую руку)", false, function(v) STATE.AutoTotem = v end)
+addToggle("AutoTotem (тотем в левую руку)", false, function(v)
+	STATE.AutoTotem = v
+	if v then CACHE.AutoScanTries = 0 ensureDiagnostics("включён AutoTotem") end
+end)
 addToggle("Тотем всегда (иначе на низком HP)", true, function(v) STATE.TotemAlways = v end)
 
 addSection("⚙  НАСТРОЙКИ")
@@ -1283,7 +1696,18 @@ addButton("Свапнуть тотем сейчас", Color3.fromRGB(120, 85, 20
 	local ok = swapTotemNow()
 	Log("Ручной свап тотема: " .. (ok and "OK" or "не получилось - смотри лог выше"))
 end)
+addButton("Самопроверка 1 раз (итог сюда + F9)", Color3.fromRGB(35, 120, 80), function()
+	runSelfDiagnostics(true, "кнопка в меню")
+end)
 addButton("Дамп предметов и ремотов (F9)", Color3.fromRGB(45, 70, 140), dumpDebug)
+
+addSection("🎒 СЛОТЫ ХОТБАРА (0 = авто из самопроверки)")
+addStepper("Слот: Respawn Anchor", CONFIG.ManualHotbarSlots.Anchor, 0, 9, 1, "%.0f", function(v) CONFIG.ManualHotbarSlots.Anchor = v end)
+addStepper("Слот: Glowstone", CONFIG.ManualHotbarSlots.Glowstone, 0, 9, 1, "%.0f", function(v) CONFIG.ManualHotbarSlots.Glowstone = v end)
+addStepper("Слот: Obsidian", CONFIG.ManualHotbarSlots.Obsidian, 0, 9, 1, "%.0f", function(v) CONFIG.ManualHotbarSlots.Obsidian = v end)
+addStepper("Слот: End Crystal", CONFIG.ManualHotbarSlots.Crystal, 0, 9, 1, "%.0f", function(v) CONFIG.ManualHotbarSlots.Crystal = v end)
+addStepper("Слот: Totem", CONFIG.ManualHotbarSlots.Totem, 0, 9, 1, "%.0f", function(v) CONFIG.ManualHotbarSlots.Totem = v end)
+addStepper("Слот: оружие (меч)", CONFIG.ManualHotbarSlots.Weapon, 0, 9, 1, "%.0f", function(v) CONFIG.ManualHotbarSlots.Weapon = v end)
 
 -- Статус / цель / лог
 UI.StatusLabel = create("TextLabel", {
@@ -1315,15 +1739,23 @@ UI.LogLabel.Text = table.concat(LogLines, "\n")
 local function setGuiOpen(open)
 	STATE.GuiOpen = open
 	main.Visible = open
-	openButton.Visible = not open
+	openButton.Visible = true -- кнопка F видна всегда: ей можно открыть меню без клавиатуры
+	openButton.BackgroundColor3 = open and Color3.fromRGB(120, 120, 140) or COLORS.Accent
+end
+local function toggleGui()
+	setGuiOpen(not STATE.GuiOpen)
 end
 closeButton.MouseButton1Click:Connect(function() setGuiOpen(false) end)
-openButton.MouseButton1Click:Connect(function() setGuiOpen(true) end)
+openButton.MouseButton1Click:Connect(toggleGui)
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if gameProcessed then return end
-	if input.KeyCode == Enum.KeyCode.RightShift or input.KeyCode == Enum.KeyCode.Insert then
-		setGuiOpen(not STATE.GuiOpen)
+	local kc = input.KeyCode
+	-- модификаторы срабатывают, даже если движок пометил ввод как processed
+	-- (из-за этого раньше у части игроков RightShift "не открывал" меню)
+	if kc == Enum.KeyCode.RightShift or kc == Enum.KeyCode.Insert or kc == Enum.KeyCode.RightControl then
+		toggleGui()
+	elseif kc == Enum.KeyCode.K and not gameProcessed then
+		toggleGui()
 	end
 end)
 
@@ -1351,6 +1783,35 @@ local function makeDraggable(frame, handle)
 end
 makeDraggable(main, titleBar)
 makeDraggable(openButton, openButton)
+
+--// Самопроверка GUI: не отрисовался или родитель пропал - переповесить ------------
+local function ensureGuiVisible()
+	if screenGui.Parent and main.AbsoluteSize.X > 0 then return true end
+	for _, cand in ipairs(guiFallbackParents) do
+		if cand and cand ~= screenGui.Parent then
+			if pcall(function() screenGui.Parent = cand end) then
+				task.wait(0.25)
+				if screenGui.Parent == cand and main.AbsoluteSize.X > 0 then
+					pcall(function() Log("GUI переповешен в: " .. cand:GetFullName()) end)
+					return true
+				end
+			end
+		end
+	end
+	if not screenGui.Parent then
+		for _, cand in ipairs(guiFallbackParents) do
+			if cand and pcall(function() screenGui.Parent = cand end) then break end
+		end
+	end
+	return screenGui.Parent ~= nil
+end
+task.spawn(function()
+	task.wait(0.6)
+	while isRunning() do
+		pcall(ensureGuiVisible)
+		task.wait(2)
+	end
+end)
 
 --// Главные циклы ------------------------------------------------------------------
 task.spawn(function()
@@ -1387,9 +1848,33 @@ task.spawn(function()
 	end
 end)
 
+task.spawn(function()
+	task.wait(1.2)
+	if isRunning() then ensureDiagnostics("автозапуск: один раз проверяю игру сам") end
+	while isRunning() do
+		task.wait(3)
+		if (STATE.AutoCrystal or STATE.AutoTotem) and CACHE.AutoScanTries < 6
+			and (os.clock() - CACHE.LastScanAt > 8) then
+			local need = false
+			pcall(function() need = needsDiagnosis() end)
+			if need then
+				CACHE.AutoScanTries = CACHE.AutoScanTries + 1
+				pcall(function() runSelfDiagnostics(true, "кит ещё не найден, тихий доскан", true) end)
+			end
+		end
+	end
+end)
+
 LocalPlayer.CharacterAdded:Connect(function()
 	Log("Персонаж возродился - скрипт продолжает работу")
 	STATE.LastTotemAttempt = 0
+	CACHE.AutoScanTries = 0
+	CACHE.OffhandValueObj = nil -- Value-объект мог быть в старом персонаже
+	CACHE.LastScanAt = 0
+	task.spawn(function()
+		task.wait(0.4)
+		pcall(ensureGuiVisible)
+	end)
 end)
 
 setGuiOpen(true)
@@ -1398,5 +1883,5 @@ if game.PlaceId ~= CONFIG.ExpectedPlaceId then
 else
 	Log("Kit PvP определена. Готово к тестам на приватном сервере.")
 end
-Log("Загружено: RightShift - меню, кнопка F - открыть. Положи Anchor/Glowstone/Obsidian/Crystal/Totem в хотбар!")
+Log("Загружено: меню - RightShift/Insert/RightControl/K или кнопка F слева вверху. Положи Anchor/Glowstone/Obsidian/Crystal/Totem в хотбар!")
 
