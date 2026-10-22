@@ -6,8 +6,9 @@
   дыр античита своей игры.
 
   УПРАВЛЕНИЕ:
-    RightShift / Insert  - открыть / закрыть ClickGUI
-    Кнопка [F] на экране - открыть GUI, когда оно закрыто (для мобильных)
+    RightShift / Insert / RightControl / K - открыть / закрыть ClickGUI
+    Круглая кнопка [F] слева вверху экрана видна ВСЕГДА - тап по ней
+    открывает/закрывает меню (для мобильных, если нет клавиатуры)
 
   ПОДГОТОВКА (важно):
     Положи в хотбар / рюкзак: Respawn Anchor, Glowstone, Obsidian,
@@ -28,6 +29,8 @@ _G.__FILOSOF_RUN_ID = RUN_ID
 local function isRunning()
 	return _G.__FILOSOF_RUN_ID == RUN_ID
 end
+
+print("[FILOSOF] Скрипт запущен, загружаюсь... (меню должно появиться сразу; если нет - скинь красную ошибку из консоли F9)")
 
 --// Конфиг --------------------------------------------------------------------
 local CONFIG = {
@@ -79,14 +82,24 @@ local STATE = {
 	OffhandText = "?",
 }
 
---// Сервисы -------------------------------------------------------------------
-local Players           = game:GetService("Players")
-local RunService        = game:GetService("RunService")
-local UserInputService  = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local VirtualInputManager = game:GetService("VirtualInputManager")
+--// Сервисы (через pcall: недоступный сервис НЕ должен убивать скрипт до GUI) ---
+local function getService(name)
+	local ok, svc = pcall(function() return game:GetService(name) end)
+	return (ok and svc) or nil
+end
+local Players           = getService("Players")
+local RunService        = getService("RunService")
+local UserInputService  = getService("UserInputService")
+local ReplicatedStorage = getService("ReplicatedStorage")
+-- VirtualInputManager в обычном клиенте может быть недоступен без прав экзекьютора.
+-- nil допустим: все его вызовы ниже обёрнуты в pcall и имеют фолбэки.
+local VirtualInputManager = getService("VirtualInputManager")
 
-local LocalPlayer = Players.LocalPlayer
+local LocalPlayer = (Players and Players.LocalPlayer) or nil
+if not LocalPlayer then
+	warn("[FILOSOF] LocalPlayer не найден: скрипт запущен НЕ на клиенте (серверный Script?). Нужен экзекьютор или LocalScript.")
+	return
+end
 
 local DIGIT_KEYS = {
 	Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three,
@@ -1049,22 +1062,43 @@ end
 local GUI_NAME = "FilosofKitPvPTester"
 
 local guiParent = nil
+local guiFallbackParents = {}
 do
+	-- Сначала PlayerGui: он рисуется в ЛЮБОМ окружении (Studio, ПК/телефон экзекьюторы).
+	-- gethui() у части экзекьюторов возвращает контейнер, где ScreenGui не виден -
+	-- поэтому теперь это только запасной вариант, а не основной.
+	local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then
+		local ok, res = pcall(function() return LocalPlayer:WaitForChild("PlayerGui", 8) end)
+		if ok then playerGui = res end
+	end
+	if playerGui then table.insert(guiFallbackParents, playerGui) end
+
 	local gethui = getGlobal("gethui")
 	if gethui then
 		local ok, res = pcall(gethui)
-		if ok and res then guiParent = res end
+		if ok and res and res ~= playerGui then table.insert(guiFallbackParents, res) end
 	end
-	if not guiParent then
-		guiParent = LocalPlayer:WaitForChild("PlayerGui")
+
+	local coreGui = getService("CoreGui")
+	if coreGui then
+		local already = false
+		for _, c in ipairs(guiFallbackParents) do if c == coreGui then already = true end end
+		if not already then table.insert(guiFallbackParents, coreGui) end
 	end
+
+	guiParent = guiFallbackParents[1]
 end
--- убрать старое GUI
-for _, holder in ipairs({ guiParent, LocalPlayer:FindFirstChildOfClass("PlayerGui") }) do
-	if holder then
+if not guiParent then
+	warn("[FILOSOF] Не нашёл, куда повесить GUI (нет PlayerGui/gethui/CoreGui). Скинь консоль F9.")
+	return
+end
+-- убрать старое GUI из всех возможных мест
+for _, holder in ipairs(guiFallbackParents) do
+	pcall(function()
 		local old = holder:FindFirstChild(GUI_NAME)
 		if old then old:Destroy() end
-	end
+	end)
 end
 
 local function create(className, props, parent)
@@ -1072,7 +1106,14 @@ local function create(className, props, parent)
 	for k, v in pairs(props or {}) do
 		pcall(function() obj[k] = v end)
 	end
-	if parent then obj.Parent = parent end
+	if parent then
+		local okParent = pcall(function() obj.Parent = parent end)
+		if not okParent and className == "ScreenGui" then
+			for _, cand in ipairs(guiFallbackParents) do
+				if pcall(function() obj.Parent = cand end) then break end
+			end
+		end
+	end
 	return obj
 end
 
@@ -1089,16 +1130,19 @@ local COLORS = {
 }
 
 local screenGui = create("ScreenGui", {
-	Name = GUI_NAME, ResetOnSpawn = false, DisplayOrder = 999,
+	Name = GUI_NAME, ResetOnSpawn = false, DisplayOrder = 999, Enabled = true,
 	IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, guiParent)
+pcall(function()
+	Log("GUI создан в: " .. tostring(screenGui.Parent and screenGui.Parent:GetFullName() or "??? (нет родителя!)"))
+end)
 
--- Плавающая кнопка открытия (видно, когда GUI закрыто)
+-- Плавающая кнопка открытия: видна ВСЕГДА, слева вверху под топбаром
 local openButton = create("TextButton", {
 	Name = "OpenButton", Text = "F", Font = Enum.Font.GothamBlack, TextSize = 22,
 	TextColor3 = Color3.fromRGB(20, 20, 20), BackgroundColor3 = COLORS.Accent,
-	Size = UDim2.new(0, 46, 0, 46), Position = UDim2.new(0, 14, 0.5, -23),
-	Visible = false, AutoButtonColor = true,
+	Size = UDim2.new(0, 46, 0, 46), Position = UDim2.new(0, 14, 0, 84),
+	Visible = true, AutoButtonColor = true,
 }, screenGui)
 create("UICorner", { CornerRadius = UDim.new(1, 0) }, openButton)
 create("UIStroke", { Color = Color3.fromRGB(0, 0, 0), Thickness = 2 }, openButton)
@@ -1111,6 +1155,17 @@ local main = create("Frame", {
 }, screenGui)
 create("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
 create("UIStroke", { Color = COLORS.Accent, Thickness = 1.5 }, main)
+-- не давать окну уехать за края на телефоне / маленьком окне
+pcall(function()
+	local cam = workspace.CurrentCamera
+	if cam then
+		local vs = cam.ViewportSize
+		local w = math.min(348, math.max(280, vs.X - 16))
+		local h = math.min(470, math.max(300, vs.Y - 70))
+		main.Size = UDim2.new(0, w, 0, h)
+		main.Position = UDim2.new(0.5, -w / 2, 0.5, -h / 2)
+	end
+end)
 
 local titleBar = create("Frame", {
 	Name = "TitleBar", BackgroundColor3 = COLORS.Title, BorderSizePixel = 0,
@@ -1126,7 +1181,7 @@ create("TextLabel", {
 }, titleBar)
 
 create("TextLabel", {
-	Text = "RightShift", Font = Enum.Font.Gotham, TextSize = 11,
+	Text = "RShift/K", Font = Enum.Font.Gotham, TextSize = 11,
 	TextColor3 = COLORS.SubText, BackgroundTransparency = 1,
 	Size = UDim2.new(0, 54, 1, 0), Position = UDim2.new(1, -88, 0, 0),
 }, titleBar)
@@ -1315,15 +1370,23 @@ UI.LogLabel.Text = table.concat(LogLines, "\n")
 local function setGuiOpen(open)
 	STATE.GuiOpen = open
 	main.Visible = open
-	openButton.Visible = not open
+	openButton.Visible = true -- кнопка F видна всегда: ей можно открыть меню без клавиатуры
+	openButton.BackgroundColor3 = open and Color3.fromRGB(120, 120, 140) or COLORS.Accent
+end
+local function toggleGui()
+	setGuiOpen(not STATE.GuiOpen)
 end
 closeButton.MouseButton1Click:Connect(function() setGuiOpen(false) end)
-openButton.MouseButton1Click:Connect(function() setGuiOpen(true) end)
+openButton.MouseButton1Click:Connect(toggleGui)
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if gameProcessed then return end
-	if input.KeyCode == Enum.KeyCode.RightShift or input.KeyCode == Enum.KeyCode.Insert then
-		setGuiOpen(not STATE.GuiOpen)
+	local kc = input.KeyCode
+	-- модификаторы срабатывают, даже если движок пометил ввод как processed
+	-- (из-за этого раньше у части игроков RightShift "не открывал" меню)
+	if kc == Enum.KeyCode.RightShift or kc == Enum.KeyCode.Insert or kc == Enum.KeyCode.RightControl then
+		toggleGui()
+	elseif kc == Enum.KeyCode.K and not gameProcessed then
+		toggleGui()
 	end
 end)
 
@@ -1351,6 +1414,35 @@ local function makeDraggable(frame, handle)
 end
 makeDraggable(main, titleBar)
 makeDraggable(openButton, openButton)
+
+--// Самопроверка GUI: не отрисовался или родитель пропал - переповесить ------------
+local function ensureGuiVisible()
+	if screenGui.Parent and main.AbsoluteSize.X > 0 then return true end
+	for _, cand in ipairs(guiFallbackParents) do
+		if cand and cand ~= screenGui.Parent then
+			if pcall(function() screenGui.Parent = cand end) then
+				task.wait(0.25)
+				if screenGui.Parent == cand and main.AbsoluteSize.X > 0 then
+					pcall(function() Log("GUI переповешен в: " .. cand:GetFullName()) end)
+					return true
+				end
+			end
+		end
+	end
+	if not screenGui.Parent then
+		for _, cand in ipairs(guiFallbackParents) do
+			if cand and pcall(function() screenGui.Parent = cand end) then break end
+		end
+	end
+	return screenGui.Parent ~= nil
+end
+task.spawn(function()
+	task.wait(0.6)
+	while isRunning() do
+		pcall(ensureGuiVisible)
+		task.wait(2)
+	end
+end)
 
 --// Главные циклы ------------------------------------------------------------------
 task.spawn(function()
@@ -1390,6 +1482,10 @@ end)
 LocalPlayer.CharacterAdded:Connect(function()
 	Log("Персонаж возродился - скрипт продолжает работу")
 	STATE.LastTotemAttempt = 0
+	task.spawn(function()
+		task.wait(0.4)
+		pcall(ensureGuiVisible)
+	end)
 end)
 
 setGuiOpen(true)
@@ -1398,5 +1494,5 @@ if game.PlaceId ~= CONFIG.ExpectedPlaceId then
 else
 	Log("Kit PvP определена. Готово к тестам на приватном сервере.")
 end
-Log("Загружено: RightShift - меню, кнопка F - открыть. Положи Anchor/Glowstone/Obsidian/Crystal/Totem в хотбар!")
+Log("Загружено: меню - RightShift/Insert/RightControl/K или кнопка F слева вверху. Положи Anchor/Glowstone/Obsidian/Crystal/Totem в хотбар!")
 
